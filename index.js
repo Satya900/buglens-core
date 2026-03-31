@@ -4,6 +4,8 @@ import axios from "axios";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import crypto from "crypto";
 import { saveReview } from './lib/supabase.js';
+import { createAppAuth } from "@octokit/auth-app";
+import { Octokit } from "@octokit/rest";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ 
@@ -11,7 +13,17 @@ const model = genAI.getGenerativeModel({
   systemInstruction: "You are a senior tech lead and security auditor. Your goal is high-precision code reviews. \nRULES:\n1. Be extremely cautious with library names (e.g., look for 'lucide-react' vs 'luide'). \n2. Do NOT suggest code that contains typos.\n3. If you see a typo in the original code, suggest the CORRECT package name (e.g., 'lucide-react').\n4. Never hallucinate nonexistent libraries."
 });
 
-// Middleware to verify GitHub Webhook signature
+// Professional GitHub App Auth Setup
+async function getAuthenticatedClient(installationId) {
+  const auth = createAppAuth({
+    appId: process.env.GITHUB_APP_ID,
+    privateKey: process.env.GITHUB_PRIVATE_KEY,
+    installationId: installationId,
+  });
+  const { token } = await auth({ type: 'installation' });
+  return new Octokit({ auth: token });
+}
+
 function verifySignature(req, res, next) {
   const signature = req.headers["x-hub-signature-256"];
   if (!signature) {
@@ -65,7 +77,6 @@ function getReviewInsights(patch, targetLine = null) {
   return firstModification || { position: 1, line: 1 };
 }
 
-// Helper to extract structured findings for DB
 function parseFinding(review, file, defaultLine) {
   const severityMatch = review.match(/\[(HIGH|MEDIUM|LOW)\]/);
   const lineMatch = review.match(/\[Line (\d+)\]/i);
@@ -88,7 +99,6 @@ function parseFinding(review, file, defaultLine) {
 }
 
 const app = express();
-// Capture raw body for signature verification
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -98,8 +108,9 @@ app.use(express.json({
 app.post("/webhook", verifySignature, async (req, res) => {
   try {
     const event = req.headers["x-github-event"];
+    const installationId = req.body.installation?.id;
 
-    if (event === "pull_request") {
+    if (event === "pull_request" && installationId) {
       const action = req.body.action;
 
       if (action === "opened" || action === "synchronize") {
@@ -108,21 +119,17 @@ app.post("/webhook", verifySignature, async (req, res) => {
         const [owner, repoName] = repoFullName.split("/");
         const pull_number = pr.number;
 
-        console.log(`🚀 PR Event [${action.toUpperCase()}] Received: ${repoFullName} #${pull_number}`);
+        console.log(`🚀 Professional PR Event [${action.toUpperCase()}] Received: ${repoFullName} #${pull_number}`);
 
         try {
-          const filesUrl = `${pr.url}/files`;
-          console.log(`📡 Fetching files from: ${filesUrl}`);
+          const octokit = await getAuthenticatedClient(installationId);
           
-          const response = await axios.get(filesUrl, {
-            headers: {
-              Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-              Accept: "application/vnd.github+json",
-            },
-            timeout: 10000
+          const { data: files } = await octokit.pulls.listFiles({
+            owner,
+            repo: repoName,
+            pull_number,
           });
 
-          const files = response.data;
           console.log(`📊 Found ${files.length} changed files.`);
           let allComments = [];
           let allReviews = [];
@@ -130,8 +137,6 @@ app.post("/webhook", verifySignature, async (req, res) => {
 
           for (const file of files) {
             if (file.patch) {
-              console.log("📄 Reviewing:", file.filename);
-
               const prompt = `PR Title: ${pr.title}\nReview this code diff for file ${file.filename}:\n\n${file.patch}\n\nRules: 1. Max 3 issues. 2. Use: [HIGH] for security/critical, [MEDIUM] for logic/bugs, [LOW] for style. 3. Be EXTREMELY precise. 4. Identify the line number (start with [Line XX]). 5. Code suggestions must be valid and directly fix the issue. 6. If no issues, respond: NO_ISSUES. Output format (repeat for each issue): ⚠️ [SEVERITY] [Line XX] [Issue]\n\n\`\`\`suggestion\n[verified fix]\n\`\`\``;
 
               try {
@@ -139,7 +144,6 @@ app.post("/webhook", verifySignature, async (req, res) => {
                 const reviewText = aiResponse.response.text();
                 
                 if (reviewText.includes("NO_ISSUES")) {
-                  console.log("⏭ Skipping review for", file.filename, "(no issues)");
                   allReviews.push({ file: file.filename, review: "✅ Clean" });
                   continue;
                 }
@@ -160,7 +164,6 @@ app.post("/webhook", verifySignature, async (req, res) => {
                       position: position,
                       body: `🧠 **BugLens Review**\n\n${singleFinding}`,
                     });
-                    console.log(`✅ Staged inline comment for ${file.filename} at line ${line}`);
                   }
                 }
               } catch (aiErr) {
@@ -169,90 +172,43 @@ app.post("/webhook", verifySignature, async (req, res) => {
             }
           }
 
-          if (allReviews.length > 0 || files.length > 0) {
-            const summaryPrompt = `Analyze these file-level reviews and provide a summary:
-${allReviews.map((r) => `File: ${r.file}\nReview: ${r.review}`).join("\n\n")}
-
-Decide merge status: APPROVE or REQUEST_CHANGES
-Identify the biggest risk.
-Concise (max 6 lines).
-
-Output format:
-Merge Status: ...
-Key Risk: ...
-Summary: ...
-Recommended Action: ...`;
+          if (allReviews.length > 0) {
+            const summaryPrompt = `Analyze these file-level reviews and provide a summary:\n${allReviews.map((r) => `File: ${r.file}\nReview: ${r.review}`).join("\n\n")}\n\nDecide merge status: APPROVE or REQUEST_CHANGES\nIdentify the biggest risk.\nConcise (max 6 lines).\n\nOutput format:\nMerge Status: ...\nKey Risk: ...\nSummary: ...\nRecommended Action: ...`;
 
             try {
               const summaryResponse = await model.generateContent(summaryPrompt);
               const mainSummary = summaryResponse.response.text();
               const decision = mainSummary.includes("REQUEST_CHANGES") ? "REQUEST_CHANGES" : "APPROVE";
 
-              let reviewPosted = false;
-              try {
-                await axios.post(
-                  `https://api.github.com/repos/${owner}/${repoName}/pulls/${pull_number}/reviews`,
-                  {
-                    body: `🧠 **BugLens PR Summary**\n\n${mainSummary}\n\n---\n_Decision generated based on ${allReviews.length} file-level insights._`,
-                    event: decision === "APPROVE" ? "APPROVE" : "REQUEST_CHANGES",
-                    comments: allComments,
-                  },
-                  {
-                    headers: {
-                      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                      Accept: "application/vnd.github+json",
-                    },
-                  }
-                );
-                console.log(`✅ Review posted: ${decision}`);
-                reviewPosted = true;
-              } catch (reviewErr) {
-                if (reviewErr.response?.status === 422) {
-                  await axios.post(
-                    `https://api.github.com/repos/${owner}/${repoName}/pulls/${pull_number}/reviews`,
-                    {
-                      body: `🧠 **BugLens PR Summary** (Self-Review Mode)\n\n${mainSummary}\n\n---\n_Review generated based on ${allReviews.length} file-level insights._`,
-                      event: "COMMENT",
-                      comments: allComments,
-                    },
-                    {
-                      headers: {
-                        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                        Accept: "application/vnd.github+json",
-                      },
-                    }
-                  );
-                  console.log("✅ Review posted as COMMENT (Self-Review)");
-                  reviewPosted = true;
-                } else {
-                  console.error("❌ GitHub Review API error:", reviewErr.message);
-                }
-              }
+              await octokit.pulls.createReview({
+                owner,
+                repo: repoName,
+                pull_number,
+                body: `🧠 **BugLens PR Summary**\n\n${mainSummary}\n\n---\n_Review generated by BugLens AI Bot._`,
+                event: decision === "APPROVE" ? "APPROVE" : "REQUEST_CHANGES",
+                comments: allComments,
+              });
 
-              // Always sync to DB if review was posted
-              if (reviewPosted) {
-                await saveReview({
-                  repoFullName: repoFullName,
-                  prNumber: pull_number,
-                  prTitle: pr.title,
-                  prAuthor: pr.user.login,
-                  prUrl: pr.html_url,
-                  mergeDecision: decision,
-                  riskSummary: mainSummary.match(/Key Risk:\s*(.*)/)?.[1] || "Reviewed",
-                  filesReviewed: files.length,
-                  findings: allFindings,
-                });
-              }
+              console.log(`✅ Professional review posted via GitHub App: ${decision}`);
+
+              await saveReview({
+                repoFullName: repoFullName,
+                prNumber: pull_number,
+                prTitle: pr.title,
+                prAuthor: pr.user.login,
+                prUrl: pr.html_url,
+                mergeDecision: decision,
+                riskSummary: mainSummary.match(/Key Risk:\s*(.*)/)?.[1] || "Reviewed",
+                filesReviewed: files.length,
+                findings: allFindings,
+              });
 
             } catch (sumErr) {
-              console.error("❌ Summary Generation Failed:", sumErr.message);
+              console.error("❌ Review Submission Failed:", sumErr.message);
             }
           }
         } catch (err) {
           console.error("❌ Error processing PR review:", err.message);
-          if (err.response) {
-            console.error("📌 Error Data:", JSON.stringify(err.response.data, null, 2));
-          }
         }
       }
     }
@@ -260,13 +216,11 @@ Recommended Action: ...`;
     res.sendStatus(200);
   } catch (globalErr) {
     console.error("⛔ CRITICAL CRASH in Webhook Handler:", globalErr);
-    if (!res.headersSent) {
-      res.status(500).send("Internal Server Error");
-    }
+    if (!res.headersSent) res.status(500).send("Internal Server Error");
   }
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 BugLens Core running on ${PORT}`);
+  console.log(`🚀 BugLens Core (Bot Mode) running on ${PORT}`);
 });
