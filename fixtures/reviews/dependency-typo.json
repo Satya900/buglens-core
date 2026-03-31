@@ -1,0 +1,27 @@
+{
+  "name": "Detect suspicious dependency typo in package.json",
+  "pull_request": {
+    "title": "Add icons package"
+  },
+  "files": [
+    {
+      "filename": "package.json",
+      "patch": "@@ -4,6 +4,7 @@\n   \"dependencies\": {\n+    \"luide-react\": \"^0.1.0\",\n     \"express\": \"^5.2.1\"\n   }\n }\n"
+    }
+  ],
+  "replay_ai_responses": {
+    "package.json": "⚠️ [MEDIUM] [Line 5] The dependency name looks incorrect and may fail at install time.\n\n```suggestion\n    \"lucide-react\": \"^0.1.0\",\n```"
+  },
+  "expected_findings": [
+    {
+      "file": "package.json",
+      "line": 5,
+      "severity": "MEDIUM",
+      "message": "Suspicious dependency name \"luide-react\". This looks like a typo for \"lucide-react\"."
+    }
+  ],
+  "thresholds": {
+    "min_precision": 0.5,
+    "min_recall": 1.0
+  }
+}

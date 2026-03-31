@@ -1,247 +1,240 @@
-import 'dotenv/config';
+import "dotenv/config";
 import express from "express";
-import axios from "axios";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import crypto from "crypto";
-import { saveReview } from './lib/supabase.js';
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/rest";
+import { getRepoReviewConfig, saveReview, saveShadowReview } from "./lib/supabase.js";
+import { analyzePullRequest } from "./lib/review-engine.js";
+import { buildRepoProfile } from "./lib/repo-profile.js";
+
+const REQUIRED_ENV_VARS = [
+  "GEMINI_API_KEY",
+  "GITHUB_APP_ID",
+  "GITHUB_PRIVATE_KEY",
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "WEBHOOK_SECRET",
+];
+const DEFAULT_SHADOW_MODE = process.env.SHADOW_MODE !== "false";
+
+function validateEnvironment() {
+  const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+  }
+}
+
+validateEnvironment();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ 
+const model = genAI.getGenerativeModel({
   model: "gemini-2.5-flash",
-  systemInstruction: "You are a senior tech lead and security auditor. Your goal is high-precision code reviews. \nRULES:\n1. Be extremely cautious with library names (e.g., look for 'lucide-react' vs 'luide'). \n2. Do NOT suggest code that contains typos.\n3. If you see a typo in the original code, suggest the CORRECT package name (e.g., 'lucide-react').\n4. Never hallucinate nonexistent libraries."
+  systemInstruction:
+    "You are a senior tech lead and security auditor. Your goal is high-precision code reviews.\n" +
+    "Rules:\n" +
+    "1. Review only real issues that are directly supported by the diff.\n" +
+    "2. Prioritize security, correctness, and reliability over style.\n" +
+    "3. If no actionable issue exists, respond exactly with NO_ISSUES.\n" +
+    "4. Include a valid line number in every finding.\n" +
+    "5. Code suggestions must be syntactically correct and directly fix the issue.\n" +
+    "6. Never hallucinate dependencies or APIs.",
 });
 
-// Professional GitHub App Auth Setup
 async function getAuthenticatedClient(installationId) {
   const auth = createAppAuth({
     appId: process.env.GITHUB_APP_ID,
     privateKey: process.env.GITHUB_PRIVATE_KEY,
-    installationId: installationId,
+    installationId,
   });
-  const { token } = await auth({ type: 'installation' });
+  const { token } = await auth({ type: "installation" });
   return new Octokit({ auth: token });
 }
 
 function verifySignature(req, res, next) {
   const signature = req.headers["x-hub-signature-256"];
   if (!signature) {
-    console.error("❌ Missing signature");
+    console.error("Missing signature");
     return res.status(401).send("No signature");
   }
 
   const hmac = crypto.createHmac("sha256", process.env.WEBHOOK_SECRET);
-  const digest = "sha256=" + hmac.update(req.rawBody).digest("hex");
+  const digest = `sha256=${hmac.update(req.rawBody).digest("hex")}`;
+  const signatureBuffer = Buffer.from(signature, "utf8");
+  const digestBuffer = Buffer.from(digest, "utf8");
 
-  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest))) {
-    console.error("❌ Invalid signature");
+  if (
+    signatureBuffer.length !== digestBuffer.length ||
+    !crypto.timingSafeEqual(signatureBuffer, digestBuffer)
+  ) {
+    console.error("Invalid signature");
     return res.status(401).send("Invalid signature");
   }
 
   next();
 }
 
-function getReviewInsights(patch, targetLine = null) {
-  const lines = patch.split("\n");
-  let currentLineInFile = 0;
-  let firstModification = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    if (line.startsWith("@@")) {
-      const match = line.match(/\+(\d+)/);
-      if (match) {
-        currentLineInFile = parseInt(match[1]) - 1;
-      }
-      continue;
-    }
-
-    const isAdded = line.startsWith("+") && !line.startsWith("+++");
-    const isUnchanged = !line.startsWith("-") && !line.startsWith("+++");
-
-    if (isAdded || isUnchanged) {
-      currentLineInFile++;
-    }
-
-    if (isAdded && !firstModification) {
-      firstModification = { position: i + 1, line: currentLineInFile };
-    }
-
-    if (targetLine && currentLineInFile === targetLine) {
-      return { position: i + 1, line: currentLineInFile };
-    }
-  }
-
-  return firstModification || { position: 1, line: 1 };
+async function fetchPullRequestFiles(octokit, owner, repo, pullNumber) {
+  return octokit.paginate(octokit.pulls.listFiles, {
+    owner,
+    repo,
+    pull_number: pullNumber,
+    per_page: 100,
+  });
 }
 
-function parseFinding(review, file, defaultLine) {
-  const severityMatch = review.match(/\[(HIGH|MEDIUM|LOW)\]/);
-  const lineMatch = review.match(/\[Line (\d+)\]/i);
-  const suggestionMatch = review.match(/```suggestion\n([\s\S]*?)```/);
-  
-  const line = lineMatch ? parseInt(lineMatch[1]) : defaultLine;
-  const message = review
-    .split('```')[0]
-    .replace(/⚠️ \[(HIGH|MEDIUM|LOW)\]/, '')
-    .replace(/\[Line \d+\]/i, '')
-    .trim();
+async function handleInstallationEvent(payload) {
+  const action = payload.action;
+  const repositories = payload.repositories || [];
+  const sender = payload.sender?.login;
 
-  return {
-    file: file,
-    line: line || 0,
-    severity: severityMatch ? severityMatch[1] : 'LOW',
-    message: message || "View full AI review on GitHub",
-    suggestion: suggestionMatch ? suggestionMatch[1].trim() : null
-  };
+  console.log(`Installation event [${action?.toUpperCase() || "UNKNOWN"}] for user ${sender}`);
+
+  if (action !== "created" && action !== "new_permissions_accepted") {
+    return;
+  }
+
+  for (const repo of repositories) {
+    await saveReview({
+      repoFullName: repo.full_name,
+      githubOwner: repo.owner?.login || sender,
+      registrationOnly: true,
+    });
+    console.log(`Registered installation for ${repo.full_name}`);
+  }
+}
+
+async function handlePullRequestEvent(payload) {
+  const installationId = payload.installation?.id;
+  const action = payload.action;
+
+  if (!installationId || (action !== "opened" && action !== "synchronize")) {
+    return;
+  }
+
+  const pr = payload.pull_request;
+  const repoFullName = payload.repository.full_name;
+  const [owner, repoName] = repoFullName.split("/");
+  const pullNumber = pr.number;
+  const deliveryId = payload.deliveryId;
+
+  console.log(`Processing PR event ${action.toUpperCase()} for ${repoFullName} #${pullNumber}`);
+
+  const octokit = await getAuthenticatedClient(installationId);
+  const files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
+  const repoConfig = await getRepoReviewConfig({ repoFullName, githubOwner: owner });
+
+  if (repoConfig && repoConfig.isActive === false) {
+    console.log(`Skipping inactive repository ${repoFullName}.`);
+    return;
+  }
+
+  const repoProfile = buildRepoProfile({ repoFullName, files });
+  const runtimeShadowMode = repoConfig ? repoConfig.shadowMode : DEFAULT_SHADOW_MODE;
+  const reviewStrictness = repoConfig?.reviewStrictness || "balanced";
+  const shouldPostReview = repoConfig
+    ? repoConfig.shadowMode === false && repoConfig.autoPostReviews === true
+    : DEFAULT_SHADOW_MODE === false;
+  const analysis = await analyzePullRequest({
+    files,
+    model,
+    pr,
+    repoProfile,
+    reviewStrictness,
+  });
+
+  console.log(
+    `Fetched ${files.length} changed files, ${analysis.reviewableFiles.length} eligible for review, ${analysis.findings.length} finding(s). Strictness=${reviewStrictness}, shadow=${runtimeShadowMode}, autoPost=${repoConfig?.autoPostReviews === true}.`
+  );
+
+  if (shouldPostReview) {
+    await octokit.pulls.createReview({
+      owner,
+      repo: repoName,
+      pull_number: pullNumber,
+      body: `🧠 **BugLens PR Summary**\n\n${analysis.summary.body}\n\n---\n_Review generated by BugLens AI Bot._`,
+      event: analysis.summary.decision,
+      comments: analysis.inlineComments.map((comment) => ({
+        path: comment.path,
+        position: comment.position,
+        body: comment.body,
+      })),
+    });
+
+    console.log(
+      `Posted ${analysis.summary.decision} review with ${analysis.inlineComments.length} inline comment(s).`
+    );
+  } else {
+    console.log(`Review was analyzed but not posted to GitHub for ${repoFullName}.`);
+  }
+
+  if (shouldPostReview) {
+    await saveReview({
+      repoFullName,
+      githubOwner: owner,
+      prNumber: pullNumber,
+      prTitle: pr.title,
+      prAuthor: pr.user.login,
+      prUrl: pr.html_url,
+      mergeDecision: analysis.summary.decision,
+      riskSummary: analysis.summary.riskSummary,
+      filesReviewed: analysis.reviewableFiles.length,
+      findings: analysis.findings,
+      deliveryId,
+    });
+  }
+
+  await saveShadowReview({
+    repoFullName,
+    prNumber: pullNumber,
+    prTitle: pr.title,
+    prAuthor: pr.user.login,
+    prUrl: pr.html_url,
+    mergeDecision: analysis.summary.decision,
+    riskSummary: analysis.summary.riskSummary,
+    filesReviewed: analysis.reviewableFiles.length,
+    findings: analysis.findings,
+    repoProfile,
+    deliveryId,
+  });
 }
 
 const app = express();
-app.use(express.json({
-  verify: (req, res, buf) => {
-    req.rawBody = buf;
-  }
-}));
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 app.post("/webhook", verifySignature, async (req, res) => {
   try {
     const event = req.headers["x-github-event"];
-    const installationId = req.body.installation?.id;
+    const payload = {
+      ...req.body,
+      deliveryId: req.headers["x-github-delivery"],
+    };
 
-    // 🚀 CODERABBIT STYLE ONBOARDING: Handle new installs!
     if (event === "installation") {
-      const action = req.body.action;
-      const repositories = req.body.repositories || [];
-      const sender = req.body.sender?.login;
-
-      console.log(`🤖 Installation Event [${action.toUpperCase()}] for user ${sender} (${repositories.length} repos)`);
-
-      if (action === "created" || action === "new_permissions_accepted") {
-        for (const repo of repositories) {
-          // We'll let the Supabase helper handle the registration/id allocation
-          await saveReview({
-            repoFullName: repo.full_name,
-            registrationOnly: true // New flag we'll handle in supabase.js
-          });
-          console.log(`📡 Registered: ${repo.full_name}`);
-        }
-      }
+      await handleInstallationEvent(payload);
       return res.sendStatus(200);
     }
 
-    if (event === "pull_request" && installationId) {
-      const action = req.body.action;
-
-      if (action === "opened" || action === "synchronize") {
-        const pr = req.body.pull_request;
-        const repoFullName = req.body.repository.full_name;
-        const [owner, repoName] = repoFullName.split("/");
-        const pull_number = pr.number;
-
-        console.log(`🚀 Professional PR Event [${action.toUpperCase()}] Received: ${repoFullName} #${pull_number}`);
-
-        try {
-          const octokit = await getAuthenticatedClient(installationId);
-          
-          const { data: files } = await octokit.pulls.listFiles({
-            owner,
-            repo: repoName,
-            pull_number,
-          });
-
-          console.log(`📊 Found ${files.length} changed files.`);
-          let allComments = [];
-          let allReviews = [];
-          let allFindings = [];
-
-          for (const file of files) {
-            if (file.patch) {
-              const prompt = `PR Title: ${pr.title}\nReview this code diff for file ${file.filename}:\n\n${file.patch}\n\nRules: 1. Max 3 issues. 2. Use: [HIGH] for security/critical, [MEDIUM] for logic/bugs, [LOW] for style. 3. Be EXTREMELY precise. 4. Identify the line number (start with [Line XX]). 5. Code suggestions must be valid and directly fix the issue. 6. If no issues, respond: NO_ISSUES. Output format (repeat for each issue): ⚠️ [SEVERITY] [Line XX] [Issue]\n\n\`\`\`suggestion\n[verified fix]\n\`\`\``;
-
-              try {
-                const aiResponse = await model.generateContent(prompt);
-                const reviewText = aiResponse.response.text();
-                
-                if (reviewText.includes("NO_ISSUES")) {
-                  allReviews.push({ file: file.filename, review: "✅ Clean" });
-                  continue;
-                }
-
-                const findingsArray = reviewText.split('⚠️').filter(f => f.trim().length > 10).map(f => '⚠️' + f);
-                allReviews.push({ file: file.filename, review: reviewText });
-
-                for (const singleFinding of findingsArray) {
-                  const findingData = parseFinding(singleFinding, file.filename, null);
-                  const { position, line } = getReviewInsights(file.patch, findingData.line);
-                  
-                  findingData.line = line;
-                  allFindings.push(findingData);
-
-                  if (position) {
-                    allComments.push({
-                      path: file.filename,
-                      position: position,
-                      body: `🧠 **BugLens Review**\n\n${singleFinding}`,
-                    });
-                  }
-                }
-              } catch (aiErr) {
-                console.error(`❌ AI Review Failed for ${file.filename}:`, aiErr.message);
-              }
-            }
-          }
-
-          if (allReviews.length > 0) {
-            const summaryPrompt = `Analyze these file-level reviews and provide a summary:\n${allReviews.map((r) => `File: ${r.file}\nReview: ${r.review}`).join("\n\n")}\n\nDecide merge status: APPROVE or REQUEST_CHANGES\nIdentify the biggest risk.\nConcise (max 6 lines).\n\nOutput format:\nMerge Status: ...\nKey Risk: ...\nSummary: ...\nRecommended Action: ...`;
-
-            try {
-              const summaryResponse = await model.generateContent(summaryPrompt);
-              const mainSummary = summaryResponse.response.text();
-              const decision = mainSummary.includes("REQUEST_CHANGES") ? "REQUEST_CHANGES" : "APPROVE";
-
-              await octokit.pulls.createReview({
-                owner,
-                repo: repoName,
-                pull_number,
-                body: `🧠 **BugLens PR Summary**\n\n${mainSummary}\n\n---\n_Review generated by BugLens AI Bot._`,
-                event: decision === "APPROVE" ? "APPROVE" : "REQUEST_CHANGES",
-                comments: allComments,
-              });
-
-              console.log(`✅ Professional review posted via GitHub App: ${decision}`);
-
-              await saveReview({
-                repoFullName: repoFullName,
-                prNumber: pull_number,
-                prTitle: pr.title,
-                prAuthor: pr.user.login,
-                prUrl: pr.html_url,
-                mergeDecision: decision,
-                riskSummary: mainSummary.match(/Key Risk:\s*(.*)/)?.[1] || "Reviewed",
-                filesReviewed: files.length,
-                findings: allFindings,
-              });
-
-            } catch (sumErr) {
-              console.error("❌ Review Submission Failed:", sumErr.message);
-            }
-          }
-        } catch (err) {
-          console.error("❌ Error processing PR review:", err.message);
-        }
-      }
+    if (event === "pull_request") {
+      await handlePullRequestEvent(payload);
     }
 
-    res.sendStatus(200);
-  } catch (globalErr) {
-    console.error("⛔ CRITICAL CRASH in Webhook Handler:", globalErr);
-    if (!res.headersSent) res.status(500).send("Internal Server Error");
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error("Webhook handler crashed:", error);
+    if (!res.headersSent) {
+      return res.status(500).send("Internal Server Error");
+    }
   }
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 BugLens Core (Bot Mode) running on ${PORT}`);
+  console.log(`BugLens Core running on ${PORT}`);
 });

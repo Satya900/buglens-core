@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node --watch index.js",
-    "test-webhook": "node scripts/test_webhook.js"
+    "test-webhook": "node scripts/test_webhook.js",
+    "eval:reviews": "node scripts/evaluate_reviews.js",
+    "eval:reviews:deterministic": "powershell -Command \"$env:EVAL_MODE='deterministic'; node scripts/evaluate_reviews.js\""
   },
   "keywords": [],
   "author": "",
