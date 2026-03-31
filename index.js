@@ -110,6 +110,27 @@ app.post("/webhook", verifySignature, async (req, res) => {
     const event = req.headers["x-github-event"];
     const installationId = req.body.installation?.id;
 
+    // 🚀 CODERABBIT STYLE ONBOARDING: Handle new installs!
+    if (event === "installation") {
+      const action = req.body.action;
+      const repositories = req.body.repositories || [];
+      const sender = req.body.sender?.login;
+
+      console.log(`🤖 Installation Event [${action.toUpperCase()}] for user ${sender} (${repositories.length} repos)`);
+
+      if (action === "created" || action === "new_permissions_accepted") {
+        for (const repo of repositories) {
+          // We'll let the Supabase helper handle the registration/id allocation
+          await saveReview({
+            repoFullName: repo.full_name,
+            registrationOnly: true // New flag we'll handle in supabase.js
+          });
+          console.log(`📡 Registered: ${repo.full_name}`);
+        }
+      }
+      return res.sendStatus(200);
+    }
+
     if (event === "pull_request" && installationId) {
       const action = req.body.action;
 
