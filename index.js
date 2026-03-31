@@ -4,7 +4,12 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import crypto from "crypto";
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/rest";
-import { getRepoReviewConfig, saveReview, saveShadowReview } from "./lib/supabase.js";
+import {
+  getRepoReviewConfig,
+  saveReview,
+  checkBillingEligibility,
+  incrementUserUsage,
+} from "./lib/supabase.js";
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
 
@@ -16,7 +21,6 @@ const REQUIRED_ENV_VARS = [
   "SUPABASE_SERVICE_ROLE_KEY",
   "WEBHOOK_SECRET",
 ];
-const DEFAULT_SHADOW_MODE = process.env.SHADOW_MODE !== "false";
 
 function validateEnvironment() {
   const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
@@ -121,7 +125,6 @@ async function handlePullRequestEvent(payload) {
   console.log(`Processing PR event ${action.toUpperCase()} for ${repoFullName} #${pullNumber}`);
 
   const octokit = await getAuthenticatedClient(installationId);
-  const files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
   const repoConfig = await getRepoReviewConfig({ repoFullName, githubOwner: owner });
 
   if (repoConfig && repoConfig.isActive === false) {
@@ -129,12 +132,26 @@ async function handlePullRequestEvent(payload) {
     return;
   }
 
+  // 1. Billing Gate
+  const billing = await checkBillingEligibility(owner);
+  if (!billing.eligible) {
+    console.log(`User ${owner} has reached their ${billing.tier} plan limit.`);
+    await octokit.issues.createComment({
+      owner,
+      repo: repoName,
+      issue_number: pullNumber,
+      body: `🛡️ **BugLens - Usage Limit Reached**\n\nYou have reached the limit for your current **${billing.tier}** plan. To continue receiving AI code reviews, please upgrade your subscription in the [BugLens Dashboard](https://buglens-next.vercel.app/billing).\n\n*Review scheduled for next month or upon upgrade.*`,
+    });
+    return;
+  }
+
+  const files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
+  if (files.length === 0) return;
+
   const repoProfile = buildRepoProfile({ repoFullName, files });
-  const runtimeShadowMode = repoConfig ? repoConfig.shadowMode : DEFAULT_SHADOW_MODE;
   const reviewStrictness = repoConfig?.reviewStrictness || "balanced";
-  const shouldPostReview = repoConfig
-    ? repoConfig.shadowMode === false && repoConfig.autoPostReviews === true
-    : DEFAULT_SHADOW_MODE === false;
+  const shouldPostReview = repoConfig ? repoConfig.isActive !== false : true;
+
   const analysis = await analyzePullRequest({
     files,
     model,
@@ -144,7 +161,7 @@ async function handlePullRequestEvent(payload) {
   });
 
   console.log(
-    `Fetched ${files.length} changed files, ${analysis.reviewableFiles.length} eligible for review, ${analysis.findings.length} finding(s). Strictness=${reviewStrictness}, shadow=${runtimeShadowMode}, autoPost=${repoConfig?.autoPostReviews === true}.`
+    `Fetched ${files.length} changed files, ${analysis.reviewableFiles.length} eligible for review, ${analysis.findings.length} finding(s). Strictness=${reviewStrictness}, posting=${shouldPostReview}.`
   );
 
   if (shouldPostReview) {
@@ -164,11 +181,8 @@ async function handlePullRequestEvent(payload) {
     console.log(
       `Posted ${analysis.summary.decision} review with ${analysis.inlineComments.length} inline comment(s).`
     );
-  } else {
-    console.log(`Review was analyzed but not posted to GitHub for ${repoFullName}.`);
-  }
 
-  if (shouldPostReview) {
+    // 2. Persist Review Data
     await saveReview({
       repoFullName,
       githubOwner: owner,
@@ -182,21 +196,12 @@ async function handlePullRequestEvent(payload) {
       findings: analysis.findings,
       deliveryId,
     });
-  }
 
-  await saveShadowReview({
-    repoFullName,
-    prNumber: pullNumber,
-    prTitle: pr.title,
-    prAuthor: pr.user.login,
-    prUrl: pr.html_url,
-    mergeDecision: analysis.summary.decision,
-    riskSummary: analysis.summary.riskSummary,
-    filesReviewed: analysis.reviewableFiles.length,
-    findings: analysis.findings,
-    repoProfile,
-    deliveryId,
-  });
+    // 3. Track Usage for Billing
+    await incrementUserUsage(owner);
+  } else {
+    console.log(`Review was analyzed but not posted to GitHub for ${repoFullName}.`);
+  }
 }
 
 const app = express();
