@@ -78,12 +78,26 @@ function verifySignature(req, res, next) {
   next();
 }
 
+const EXCLUDED_EXTENSIONS = [
+  ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf", // Media
+  ".lock", ".lockb", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", // Lockfiles
+  ".bin", ".exe", ".dll", ".so", ".dylib", // Binaries
+  ".map", ".woff", ".woff2", ".ttf", ".eot", // Fonts / Source Maps
+];
+
 async function fetchPullRequestFiles(octokit, owner, repo, pullNumber) {
-  return octokit.paginate(octokit.pulls.listFiles, {
+  const files = await octokit.paginate(octokit.pulls.listFiles, {
     owner,
     repo,
     pull_number: pullNumber,
     per_page: 100,
+  });
+
+  return files.filter((file) => {
+    const filename = file.filename.toLowerCase();
+    const isExcluded = EXCLUDED_EXTENSIONS.some((ext) => filename.endsWith(ext));
+    const isDeleted = file.status === "removed";
+    return !isExcluded && !isDeleted;
   });
 }
 
