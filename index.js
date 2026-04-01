@@ -141,7 +141,12 @@ async function handlePullRequestEvent(payload) {
   const octokit = await getAuthenticatedClient(installationId);
   const repoConfig = await getRepoReviewConfig({ repoFullName, githubOwner: owner });
 
-  if (repoConfig && repoConfig.isActive === false) {
+  if (!repoConfig) {
+    console.log(`Skipping: Repository ${repoFullName} is not registered or active in the dashboard.`);
+    return;
+  }
+
+  if (repoConfig.isActive === false) {
     console.log(`Skipping inactive repository ${repoFullName}.`);
     return;
   }
