@@ -9,6 +9,7 @@ import {
   saveReview,
   checkBillingEligibility,
   incrementUserUsage,
+  getLessonsLearned,
 } from "./lib/supabase.js";
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
@@ -151,7 +152,6 @@ async function handlePullRequestEvent(payload) {
     return;
   }
 
-  // 1. Billing Gate
   const billing = await checkBillingEligibility(owner);
   if (!billing.eligible) {
     console.log(`User ${owner} has reached their ${billing.tier} plan limit.`);
@@ -163,6 +163,9 @@ async function handlePullRequestEvent(payload) {
     });
     return;
   }
+
+  // 2. Fetch Lessons (Point 3)
+  const lessons = await getLessonsLearned({ repoFullName });
 
   const files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
   if (files.length === 0) return;
@@ -177,6 +180,7 @@ async function handlePullRequestEvent(payload) {
     pr,
     repoProfile,
     reviewStrictness,
+    lessons,
   });
 
   console.log(
