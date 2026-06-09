@@ -245,12 +245,23 @@ app.post("/webhook", verifySignature, async (req, res) => {
     };
 
     if (event === "installation") {
+      // Installation events are fast — process synchronously
       await handleInstallationEvent(payload);
       return res.sendStatus(200);
     }
 
     if (event === "pull_request") {
-      await handlePullRequestEvent(payload);
+      // Respond immediately so GitHub doesn't time out or retry.
+      // PR reviews involve multiple Gemini API calls and can take 30–60s.
+      res.sendStatus(200);
+      setImmediate(async () => {
+        try {
+          await handlePullRequestEvent(payload);
+        } catch (error) {
+          console.error("Async PR review crashed:", error);
+        }
+      });
+      return;
     }
 
     return res.sendStatus(200);
