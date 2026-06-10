@@ -1,18 +1,25 @@
 import "dotenv/config";
 import express from "express";
+import rateLimit from "express-rate-limit";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import crypto from "crypto";
+import logger from "./lib/logger.js";
+import { initSentry, captureException } from "./lib/sentry.js";
 import { createAppAuth } from "@octokit/auth-app";
 import { Octokit } from "@octokit/rest";
 import {
   getRepoReviewConfig,
   saveReview,
+  saveShadowReview,
   checkBillingEligibility,
   incrementUserUsage,
   getLessonsLearned,
+  isDeliveryAlreadyProcessed,
+  getUserEmail,
 } from "./lib/supabase.js";
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
+import { sendReviewSummaryEmail } from "./lib/email.js";
 
 const REQUIRED_ENV_VARS = [
   "GEMINI_API_KEY",
@@ -31,6 +38,7 @@ function validateEnvironment() {
 }
 
 validateEnvironment();
+await initSentry();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({
@@ -59,7 +67,7 @@ async function getAuthenticatedClient(installationId) {
 function verifySignature(req, res, next) {
   const signature = req.headers["x-hub-signature-256"];
   if (!signature) {
-    console.error("Missing signature");
+    logger.warn("Missing signature");
     return res.status(401).send("No signature");
   }
 
@@ -72,7 +80,7 @@ function verifySignature(req, res, next) {
     signatureBuffer.length !== digestBuffer.length ||
     !crypto.timingSafeEqual(signatureBuffer, digestBuffer)
   ) {
-    console.error("Invalid signature");
+    logger.warn("Invalid signature");
     return res.status(401).send("Invalid signature");
   }
 
@@ -107,7 +115,7 @@ async function handleInstallationEvent(payload) {
   const repositories = payload.repositories || [];
   const sender = payload.sender?.login;
 
-  console.log(`Installation event [${action?.toUpperCase() || "UNKNOWN"}] for user ${sender}`);
+  logger.info(`Installation event [${action?.toUpperCase() || "UNKNOWN"}] for user ${sender}`);
 
   if (action !== "created" && action !== "new_permissions_accepted") {
     return;
@@ -119,7 +127,7 @@ async function handleInstallationEvent(payload) {
       githubOwner: repo.owner?.login || sender,
       registrationOnly: true,
     });
-    console.log(`Registered installation for ${repo.full_name}`);
+    logger.info(`Registered installation for ${repo.full_name}`);
   }
 }
 
@@ -137,24 +145,30 @@ async function handlePullRequestEvent(payload) {
   const pullNumber = pr.number;
   const deliveryId = payload.deliveryId;
 
-  console.log(`Processing PR event ${action.toUpperCase()} for ${repoFullName} #${pullNumber}`);
+  // Idempotency guard: skip if this exact GitHub delivery was already processed
+  if (await isDeliveryAlreadyProcessed(deliveryId)) {
+    logger.info(`Skipping duplicate delivery ${deliveryId} for ${repoFullName} #${pullNumber}`);
+    return;
+  }
+
+  logger.info(`Processing PR event ${action.toUpperCase()} for ${repoFullName} #${pullNumber}`);
 
   const octokit = await getAuthenticatedClient(installationId);
   const repoConfig = await getRepoReviewConfig({ repoFullName, githubOwner: owner });
 
   if (!repoConfig) {
-    console.log(`Skipping: Repository ${repoFullName} is not registered or active in the dashboard.`);
+    logger.warn(`Skipping: Repository ${repoFullName} is not registered or active in the dashboard.`);
     return;
   }
 
   if (repoConfig.isActive === false) {
-    console.log(`Skipping inactive repository ${repoFullName}.`);
+    logger.warn(`Skipping inactive repository ${repoFullName}.`);
     return;
   }
 
   const billing = await checkBillingEligibility(owner);
   if (!billing.eligible) {
-    console.log(`User ${owner} has reached their ${billing.tier} plan limit.`);
+    logger.warn({ msg: "Usage limit reached", owner, tier: billing.tier });
     await octokit.issues.createComment({
       owner,
       repo: repoName,
@@ -172,7 +186,7 @@ async function handlePullRequestEvent(payload) {
 
   const repoProfile = buildRepoProfile({ repoFullName, files });
   const reviewStrictness = repoConfig?.reviewStrictness || "balanced";
-  const shouldPostReview = repoConfig ? repoConfig.isActive !== false : true;
+  const isShadowMode = repoConfig?.shadowMode === true;
 
   const analysis = await analyzePullRequest({
     files,
@@ -183,11 +197,34 @@ async function handlePullRequestEvent(payload) {
     lessons,
   });
 
-  console.log(
-    `Fetched ${files.length} changed files, ${analysis.reviewableFiles.length} eligible for review, ${analysis.findings.length} finding(s). Strictness=${reviewStrictness}, posting=${shouldPostReview}.`
-  );
+  logger.info({
+    msg: "Analysis complete",
+    repo: repoFullName,
+    pr: pullNumber,
+    files: files.length,
+    reviewable: analysis.reviewableFiles.length,
+    findings: analysis.findings.length,
+    strictness: reviewStrictness,
+    shadow: isShadowMode,
+  });
 
-  if (shouldPostReview) {
+  if (isShadowMode) {
+    // Shadow mode: run analysis but don't post to GitHub — save to shadow_reviews for dashboard visibility
+    await saveShadowReview({
+      repoFullName,
+      prNumber: pullNumber,
+      prTitle: pr.title,
+      prAuthor: pr.user.login,
+      prUrl: pr.html_url,
+      mergeDecision: analysis.summary.decision,
+      riskSummary: analysis.summary.riskSummary,
+      filesReviewed: analysis.reviewableFiles.length,
+      findings: analysis.findings,
+      repoProfile,
+      deliveryId,
+    });
+    logger.info(`Shadow review saved for ${repoFullName} #${pullNumber} (not posted to GitHub).`);
+  } else {
     await octokit.pulls.createReview({
       owner,
       repo: repoName,
@@ -201,12 +238,15 @@ async function handlePullRequestEvent(payload) {
       })),
     });
 
-    console.log(
-      `Posted ${analysis.summary.decision} review with ${analysis.inlineComments.length} inline comment(s).`
-    );
+    logger.info({
+      msg: "Review posted",
+      repo: repoFullName,
+      pr: pullNumber,
+      decision: analysis.summary.decision,
+      inlineComments: analysis.inlineComments.length,
+    });
 
-    // 2. Persist Review Data
-    await saveReview({
+    const savedReview = await saveReview({
       repoFullName,
       githubOwner: owner,
       prNumber: pullNumber,
@@ -220,10 +260,24 @@ async function handlePullRequestEvent(payload) {
       deliveryId,
     });
 
-    // 3. Track Usage for Billing
     await incrementUserUsage(owner);
-  } else {
-    console.log(`Review was analyzed but not posted to GitHub for ${repoFullName}.`);
+
+    // Send email notification to repo owner
+    if (savedReview?.id) {
+      const ownerEmail = await getUserEmail(owner);
+      if (ownerEmail) {
+        await sendReviewSummaryEmail({
+          toEmail: ownerEmail,
+          prTitle: pr.title,
+          repoFullName,
+          prUrl: pr.html_url,
+          decision: analysis.summary.decision,
+          findingsCount: analysis.findings.length,
+          riskSummary: analysis.summary.riskSummary,
+          reviewId: savedReview.id,
+        });
+      }
+    }
   }
 }
 
@@ -236,7 +290,20 @@ app.use(
   })
 );
 
-app.post("/webhook", verifySignature, async (req, res) => {
+// Rate limit: max 30 webhook calls per minute per IP.
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: "Too many requests",
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+app.post("/webhook", webhookLimiter, verifySignature, async (req, res) => {
   try {
     const event = req.headers["x-github-event"];
     const payload = {
@@ -245,20 +312,18 @@ app.post("/webhook", verifySignature, async (req, res) => {
     };
 
     if (event === "installation") {
-      // Installation events are fast — process synchronously
       await handleInstallationEvent(payload);
       return res.sendStatus(200);
     }
 
     if (event === "pull_request") {
-      // Respond immediately so GitHub doesn't time out or retry.
-      // PR reviews involve multiple Gemini API calls and can take 30–60s.
       res.sendStatus(200);
       setImmediate(async () => {
         try {
           await handlePullRequestEvent(payload);
         } catch (error) {
-          console.error("Async PR review crashed:", error);
+          logger.error({ msg: "Async PR review crashed", error: error.message });
+          captureException(error, { deliveryId: payload.deliveryId });
         }
       });
       return;
@@ -266,7 +331,8 @@ app.post("/webhook", verifySignature, async (req, res) => {
 
     return res.sendStatus(200);
   } catch (error) {
-    console.error("Webhook handler crashed:", error);
+    logger.error({ msg: "Webhook handler crashed", error: error.message });
+    captureException(error);
     if (!res.headersSent) {
       return res.status(500).send("Internal Server Error");
     }
@@ -275,5 +341,5 @@ app.post("/webhook", verifySignature, async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`BugLens Core running on ${PORT}`);
+  logger.info({ msg: "BugLens Core running", port: PORT });
 });
