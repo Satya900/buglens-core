@@ -282,6 +282,7 @@ async function handlePullRequestEvent(payload) {
 }
 
 const app = express();
+app.set('trust proxy', 1); // trust Render/Railway reverse proxy for rate limiting
 app.use(
   express.json({
     verify: (req, _res, buf) => {
