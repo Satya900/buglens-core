@@ -15,10 +15,11 @@ import {
   incrementUserUsage,
   getLessonsLearned,
   isDeliveryAlreadyProcessed,
-  getUserEmail,
+  getUserEmailPrefs,
 } from "./lib/supabase.js";
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
+import { readRepoBugLensConfig, mergeConfigs } from "./lib/config-reader.js";
 import { sendReviewSummaryEmail } from "./lib/email.js";
 
 const REQUIRED_ENV_VARS = [
@@ -227,12 +228,45 @@ async function handlePullRequestEvent(payload) {
   // 2. Fetch Lessons (Point 3)
   const lessons = await getLessonsLearned({ repoFullName });
 
-  const files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
+  // Read .buglens.yml from repo root (if present) and merge with dashboard config
+  const fileConfig = await readRepoBugLensConfig(octokit, owner, repoName, pr.head.sha);
+  const mergedConfig = mergeConfigs(repoConfig, fileConfig);
+
+  let files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
   if (files.length === 0) return;
 
+  // Apply ignore patterns from .buglens.yml
+  if (mergedConfig.ignorePatterns?.length > 0) {
+    const ignored = mergedConfig.ignorePatterns;
+    files = files.filter((f) => {
+      return !ignored.some((pattern) => {
+        // Simple glob: support ** prefix/suffix and exact match
+        if (pattern.startsWith("**/")) {
+          const suffix = pattern.slice(3);
+          return f.filename.endsWith(suffix) || f.filename.includes(`/${suffix}`);
+        }
+        if (pattern.endsWith("/**")) {
+          const prefix = pattern.slice(0, -3);
+          return f.filename.startsWith(prefix);
+        }
+        return f.filename === pattern || f.filename.endsWith(`/${pattern}`);
+      });
+    });
+    if (files.length === 0) {
+      logger.info(`All files ignored by .buglens.yml patterns for ${repoFullName} #${pullNumber}`);
+      return;
+    }
+  }
+
+  // Apply max_files cap from .buglens.yml
+  if (mergedConfig.maxFiles && files.length > mergedConfig.maxFiles) {
+    logger.info(`Capping files from ${files.length} to ${mergedConfig.maxFiles} per .buglens.yml`);
+    files = files.slice(0, mergedConfig.maxFiles);
+  }
+
   const repoProfile = buildRepoProfile({ repoFullName, files });
-  const reviewStrictness = repoConfig?.reviewStrictness || "balanced";
-  const isShadowMode = repoConfig?.shadowMode === true;
+  const reviewStrictness = mergedConfig.reviewStrictness || "balanced";
+  const isShadowMode = mergedConfig.shadowMode === true;
 
   const analysis = await analyzePullRequest({
     files,
@@ -337,12 +371,12 @@ async function handlePullRequestEvent(payload) {
 
     await incrementUserUsage(owner);
 
-    // Send email notification to repo owner
+    // Send email notification to repo owner (respects user preference)
     if (savedReview?.id) {
-      const ownerEmail = await getUserEmail(owner);
-      if (ownerEmail) {
+      const prefs = await getUserEmailPrefs(owner);
+      if (prefs?.email && prefs.emailNotifications) {
         await sendReviewSummaryEmail({
-          toEmail: ownerEmail,
+          toEmail: prefs.email,
           prTitle: pr.title,
           repoFullName,
           prUrl: pr.html_url,
