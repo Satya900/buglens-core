@@ -1,7 +1,6 @@
 import "dotenv/config";
 import express from "express";
 import rateLimit from "express-rate-limit";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import crypto from "crypto";
 import logger from "./lib/logger.js";
 import { initSentry, captureException } from "./lib/sentry.js";
@@ -21,6 +20,7 @@ import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
 import { readRepoBugLensConfig, mergeConfigs } from "./lib/config-reader.js";
 import { sendReviewSummaryEmail } from "./lib/email.js";
+import { createModel } from "./lib/ai-provider.js";
 
 const REQUIRED_ENV_VARS = [
   "GEMINI_API_KEY",
@@ -40,20 +40,6 @@ function validateEnvironment() {
 
 validateEnvironment();
 await initSentry();
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
-  systemInstruction:
-    "You are a senior tech lead and security auditor. Your goal is high-precision code reviews.\n" +
-    "Rules:\n" +
-    "1. Review only real issues that are directly supported by the diff.\n" +
-    "2. Prioritize security, correctness, and reliability over style.\n" +
-    "3. If no actionable issue exists, respond exactly with NO_ISSUES.\n" +
-    "4. Include a valid line number in every finding.\n" +
-    "5. Code suggestions must be syntactically correct and directly fix the issue.\n" +
-    "6. Never hallucinate dependencies or APIs.",
-});
 
 async function getAuthenticatedClient(installationId) {
   const auth = createAppAuth({
@@ -224,6 +210,10 @@ async function handlePullRequestEvent(payload) {
     });
     return;
   }
+
+  // Select AI model based on billing tier
+  const model = createModel(billing.tier);
+  logger.info({ msg: "AI provider selected", tier: billing.tier, repo: repoFullName });
 
   // 2. Fetch Lessons (Point 3)
   const lessons = await getLessonsLearned({ repoFullName });
@@ -463,6 +453,85 @@ app.post("/webhook", webhookLimiter, verifySignature, async (req, res) => {
     }
   }
 });
+
+// ── DEV-ONLY: AI model test endpoint ─────────────────────────────────────────
+// POST /dev/test-ai
+// Body: { "model": "free" | "pro" | "qwen" | "gemma", "prompt": "..." }
+// Only active when NODE_ENV !== "production"
+if (process.env.NODE_ENV !== "production") {
+  const OPENROUTER_TEST_MODELS = {
+    gemma: "google/gemma-4-31b-it:free",   // primary free model
+    qwen: "qwen/qwen3-coder:free",          // secondary free model
+  };
+
+  app.post("/dev/test-ai", async (req, res) => {
+    const { model: modelKey = "free", prompt } = req.body ?? {};
+
+    if (!prompt) {
+      return res.status(400).json({ error: "prompt is required in request body" });
+    }
+
+    const startTime = Date.now();
+
+    try {
+      let testModel;
+      let providerLabel;
+
+      if (modelKey === "qwen" || modelKey === "gemma") {
+        // Test a specific OpenRouter model directly
+        const OpenAI = (await import("openai")).default;
+        const client = new OpenAI({
+          baseURL: "https://openrouter.ai/api/v1",
+          apiKey: process.env.OPENROUTER_API_KEY,
+          defaultHeaders: { "HTTP-Referer": "https://buglens.app", "X-Title": "BugLens" },
+        });
+        const modelId = OPENROUTER_TEST_MODELS[modelKey];
+        providerLabel = modelKey === "qwen" ? "OpenRouter / qwen3-coder:free" : "OpenRouter / gemma-4-31b-it:free";
+
+        const completion = await client.chat.completions.create({
+          model: modelId,
+          messages: [
+            { role: "system", content: "You are a senior code reviewer." },
+            { role: "user", content: prompt },
+          ],
+          temperature: 0.1,
+          max_tokens: 1024,
+        });
+
+        const text = completion.choices?.[0]?.message?.content?.trim() ?? "";
+        return res.json({
+          provider: providerLabel,
+          model_id: modelId,
+          response: text,
+          tokens: completion.usage ?? null,
+          latency_ms: Date.now() - startTime,
+        });
+      }
+
+      // "free" or "pro" — use the full createModel() with fallback chain
+      testModel = createModel(modelKey === "pro" ? "PRO" : "FREE");
+      providerLabel = modelKey === "pro" ? "PRO (primary model)" : "FREE (OpenRouter chain)";
+
+      const result = await testModel.generateContent(prompt);
+      const text = result.response.text();
+
+      return res.json({
+        provider: providerLabel,
+        response: text,
+        latency_ms: Date.now() - startTime,
+      });
+
+    } catch (err) {
+      return res.status(500).json({
+        error: err.message,
+        status: err?.status ?? null,
+        latency_ms: Date.now() - startTime,
+      });
+    }
+  });
+
+  logger.info("DEV endpoint active: POST /dev/test-ai");
+}
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
