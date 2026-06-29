@@ -263,6 +263,9 @@ async function handlePullRequestEvent(payload) {
     repoProfile,
     reviewStrictness,
     lessons,
+    octokit,
+    repoFullName,
+    sha: pr.head.sha,
   });
 
   logger.info({
