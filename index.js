@@ -14,6 +14,7 @@ import {
   getLessonsLearned,
   isDeliveryAlreadyProcessed,
   getUserEmailPrefs,
+  saveShadowReview,
 } from "./lib/supabase.js";
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
@@ -198,15 +199,23 @@ async function handlePullRequestEvent(payload) {
     return;
   }
 
+  // Read .buglens.yml from repo root (if present) and merge with dashboard config.
+  // Done before the billing check so shadowMode is known before we might post a
+  // "usage limit reached" comment — shadow mode must produce zero GitHub activity.
+  const fileConfig = await readRepoBugLensConfig(octokit, owner, repoName, pr.head.sha);
+  const mergedConfig = mergeConfigs(repoConfig, fileConfig);
+
   const billing = await checkBillingEligibility(owner);
   if (!billing.eligible) {
     logger.warn({ msg: "Usage limit reached", owner, tier: billing.tier });
-    await octokit.issues.createComment({
-      owner,
-      repo: repoName,
-      issue_number: pullNumber,
-      body: `🛡️ **BugLens - Usage Limit Reached**\n\nYou have reached the limit for your current **${billing.tier}** plan. To continue receiving AI code reviews, please upgrade your subscription in the [BugLens Dashboard](https://buglens-next.vercel.app/billing).\n\n*Review scheduled for next month or upon upgrade.*`,
-    });
+    if (!mergedConfig.shadowMode) {
+      await octokit.issues.createComment({
+        owner,
+        repo: repoName,
+        issue_number: pullNumber,
+        body: `🛡️ **BugLens - Usage Limit Reached**\n\nYou have reached the limit for your current **${billing.tier}** plan. To continue receiving AI code reviews, please upgrade your subscription in the [BugLens Dashboard](https://buglens-next.vercel.app/billing).\n\n*Review scheduled for next month or upon upgrade.*`,
+      });
+    }
     return;
   }
 
@@ -216,10 +225,6 @@ async function handlePullRequestEvent(payload) {
 
   // 2. Fetch Lessons (Point 3)
   const lessons = await getLessonsLearned({ repoFullName });
-
-  // Read .buglens.yml from repo root (if present) and merge with dashboard config
-  const fileConfig = await readRepoBugLensConfig(octokit, owner, repoName, pr.head.sha);
-  const mergedConfig = mergeConfigs(repoConfig, fileConfig);
 
   let files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
   if (files.length === 0) return;
@@ -277,6 +282,34 @@ async function handlePullRequestEvent(payload) {
     findings: analysis.findings.length,
     strictness: reviewStrictness,
   });
+
+  if (mergedConfig.shadowMode) {
+    await saveShadowReview({
+      repoFullName,
+      prNumber: pullNumber,
+      prTitle: pr.title,
+      prAuthor: pr.user.login,
+      prUrl: pr.html_url,
+      mergeDecision: analysis.summary.decision,
+      riskSummary: analysis.summary.riskSummary,
+      filesReviewed: analysis.reviewableFiles.length,
+      findings: analysis.findings,
+      repoProfile,
+      deliveryId,
+    });
+
+    logger.info({
+      msg: "Shadow review saved — no GitHub activity",
+      repo: repoFullName,
+      pr: pullNumber,
+      decision: analysis.summary.decision,
+      findings: analysis.findings.length,
+    });
+
+    // Shadow reviews still run the full AI pipeline, so they count against usage.
+    await incrementUserUsage(owner);
+    return;
+  }
 
   const reReviewHeader = isReReview
     ? `> 🔄 **Re-review triggered** — new commits were pushed to this PR by @${pr.user.login}. Previous BugLens review has been dismissed.\n\n`
