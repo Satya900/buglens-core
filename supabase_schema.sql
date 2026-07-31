@@ -61,6 +61,31 @@ alter table repos add column if not exists shadow_mode boolean default true;
 alter table repos add column if not exists review_strictness text default 'balanced';
 alter table repos add column if not exists auto_post_reviews boolean default false;
 
+-- lessons_learned predates this schema file (it was created directly in the
+-- Supabase dashboard), so it shipped with no user_id column and no RLS —
+-- any authenticated user could read and delete any other user's lessons.
+-- Run the backfill below once after adding the column, then verify no rows
+-- are left with a null user_id before relying on the RLS policy.
+create table if not exists lessons_learned (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade,
+  repo_full_name text not null,
+  content text not null,
+  created_at timestamptz default now()
+);
+
+alter table lessons_learned add column if not exists user_id uuid references auth.users(id) on delete cascade;
+
+-- Backfill existing rows from repo ownership. NOTE: repo_full_name is only
+-- unique per (user_id, repo_full_name), so if the same repo was ever
+-- connected by more than one account, this picks one arbitrarily — review
+-- the affected rows manually in that case before trusting the backfill.
+update lessons_learned l
+set user_id = r.user_id
+from repos r
+where l.repo_full_name = r.repo_full_name
+  and l.user_id is null;
+
 create table if not exists shadow_reviews (
   id uuid primary key default gen_random_uuid(),
   repo_full_name text not null,
@@ -88,6 +113,7 @@ alter table reviews enable row level security;
 alter table findings enable row level security;
 alter table repos enable row level security;
 alter table shadow_reviews enable row level security;
+alter table lessons_learned enable row level security;
 
 create policy "users see own profile" on profiles
 for all using (auth.uid() = id);
@@ -107,3 +133,6 @@ create policy "users see own shadow reviews" on shadow_reviews
 for all using (
   repo_full_name in (select repo_full_name from repos where user_id = auth.uid())
 );
+
+create policy "users see own lessons" on lessons_learned
+for all using (auth.uid() = user_id);
