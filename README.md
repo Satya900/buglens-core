@@ -43,7 +43,13 @@ Go to [https://github.com/settings/apps/new](https://github.com/settings/apps/ne
 - **Permissions:**
   - Pull requests: Read & Write
   - Issues: Read & Write
-- **Subscribe to events:** Pull request, Installation
+  - Contents: Read (required for the persisted repo-index feature — fetching
+    repo trees/blobs via the Git Data API. Adding this to an existing GitHub
+    App requires every currently-installed customer to re-approve the new
+    permission before push-triggered indexing works for their repos; until
+    they do, indexing silently fails closed and reviews keep working
+    exactly as before via the live one-hop context lookup)
+- **Subscribe to events:** Pull request, Installation, Push
 
 Download the private key and note the App ID.
 
