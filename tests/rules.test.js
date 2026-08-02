@@ -104,6 +104,52 @@ describe("detectDisabledAssertions", () => {
   });
 });
 
+describe("detectVariableNameMismatch", () => {
+  it("does not flag 'repo' as a typo of 'res' (regression: false positive)", () => {
+    const file = makeFile(
+      "github.js",
+      `@@ -0,0 +1,5 @@\n` +
+        `+async function fetchFile(octokit, owner, repo, filePath) {\n` +
+        `+  const res = await octokit.repos.getContent({ owner, repo, path: filePath });\n` +
+        `+  if (!res) return null;\n` +
+        `+  console.log(\`Fetching from \${repo}\`);\n` +
+        `+  return res.data;\n` +
+        `+}\n`
+    );
+    const findings = runDeterministicChecks(file);
+    assert.equal(findings.filter((f) => f.ruleId === "variable_name_mismatch").length, 0);
+  });
+
+  it("does not flag 'prev' as a typo of 'res' (regression: false positive)", () => {
+    const file = makeFile(
+      "counter.js",
+      `@@ -0,0 +1,4 @@\n` +
+        `+function useCounter() {\n` +
+        `+  const res = fetchInitial();\n` +
+        `+  setCount(prev => prev + res);\n` +
+        `+  return res;\n` +
+        `+}\n`
+    );
+    const findings = runDeterministicChecks(file);
+    assert.equal(findings.filter((f) => f.ruleId === "variable_name_mismatch").length, 0);
+  });
+
+  it("still flags a genuine long-identifier typo (supabaseAnonKey vs supabasenonKey)", () => {
+    const file = makeFile(
+      "supabase.js",
+      `@@ -0,0 +1,2 @@\n` +
+        `+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;\n` +
+        `+console.log(supabasenonKey);\n`
+    );
+    const findings = runDeterministicChecks(file);
+    const hit = findings.find((f) => f.ruleId === "variable_name_mismatch");
+    assert.ok(hit, "expected a variable_name_mismatch finding");
+    assert.equal(hit.severity, "HIGH");
+    assert.match(hit.message, /supabasenonKey/);
+    assert.match(hit.message, /supabaseAnonKey/);
+  });
+});
+
 describe("runDeterministicChecks", () => {
   it("returns empty array for file with no patch", () => {
     const file = makeFile("image.png", null);
