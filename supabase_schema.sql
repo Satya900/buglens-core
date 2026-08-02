@@ -103,10 +103,46 @@ create table if not exists shadow_reviews (
   created_at timestamptz default now()
 );
 
+-- Persisted repo index: a structural (not embedding-based) import graph for
+-- each repo's default branch, refreshed on push (and on initial repo
+-- connect), used to give AI reviews real cross-file context instead of a
+-- live per-PR one-hop lookup (see lib/repo-index.js). Joined by
+-- repo_full_name text, matching the existing shadow_reviews/lessons_learned
+-- convention, not a repos.id FK.
+create table if not exists repo_index_meta (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade,
+  repo_full_name text not null,
+  indexed_sha text,
+  status text default 'pending' check (status in ('pending', 'indexing', 'ready', 'failed')),
+  file_count integer default 0,
+  indexed_capped boolean default false,
+  last_error text,
+  last_indexed_at timestamptz,
+  created_at timestamptz default now(),
+  unique(user_id, repo_full_name)
+);
+
+create table if not exists repo_index_files (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade,
+  repo_full_name text not null,
+  file_path text not null,
+  blob_sha text not null,
+  head_snippet text,
+  imports jsonb default '[]'::jsonb,
+  imported_by jsonb default '[]'::jsonb,
+  indexed_sha text not null,
+  updated_at timestamptz default now(),
+  unique(user_id, repo_full_name, file_path)
+);
+
 create index if not exists reviews_repo_pr_idx on reviews (repo_full_name, pr_number, created_at desc);
 create index if not exists findings_review_idx on findings (review_id);
 create index if not exists repos_full_name_idx on repos (repo_full_name);
 create index if not exists shadow_reviews_repo_pr_idx on shadow_reviews (repo_full_name, pr_number, created_at desc);
+create index if not exists repo_index_files_repo_idx on repo_index_files (repo_full_name, file_path);
+create index if not exists repo_index_meta_repo_idx on repo_index_meta (repo_full_name);
 
 alter table profiles enable row level security;
 alter table reviews enable row level security;
@@ -114,6 +150,8 @@ alter table findings enable row level security;
 alter table repos enable row level security;
 alter table shadow_reviews enable row level security;
 alter table lessons_learned enable row level security;
+alter table repo_index_meta enable row level security;
+alter table repo_index_files enable row level security;
 
 create policy "users see own profile" on profiles
 for all using (auth.uid() = id);
@@ -135,4 +173,10 @@ for all using (
 );
 
 create policy "users see own lessons" on lessons_learned
+for all using (auth.uid() = user_id);
+
+create policy "users see own repo index meta" on repo_index_meta
+for all using (auth.uid() = user_id);
+
+create policy "users see own repo index files" on repo_index_files
 for all using (auth.uid() = user_id);

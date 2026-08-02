@@ -19,6 +19,7 @@ import {
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
 import { readRepoBugLensConfig, mergeConfigs } from "./lib/config-reader.js";
+import { isExcludedFile } from "./lib/file-filters.js";
 import { sendReviewSummaryEmail } from "./lib/email.js";
 import { createModel } from "./lib/ai-provider.js";
 
@@ -74,13 +75,6 @@ function verifySignature(req, res, next) {
   next();
 }
 
-const EXCLUDED_EXTENSIONS = [
-  ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf", // Media
-  ".lock", ".lockb", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", // Lockfiles
-  ".bin", ".exe", ".dll", ".so", ".dylib", // Binaries
-  ".map", ".woff", ".woff2", ".ttf", ".eot", // Fonts / Source Maps
-];
-
 async function fetchPullRequestFiles(octokit, owner, repo, pullNumber) {
   const files = await octokit.paginate(octokit.pulls.listFiles, {
     owner,
@@ -90,10 +84,8 @@ async function fetchPullRequestFiles(octokit, owner, repo, pullNumber) {
   });
 
   return files.filter((file) => {
-    const filename = file.filename.toLowerCase();
-    const isExcluded = EXCLUDED_EXTENSIONS.some((ext) => filename.endsWith(ext));
     const isDeleted = file.status === "removed";
-    return !isExcluded && !isDeleted;
+    return !isExcludedFile(file.filename) && !isDeleted;
   });
 }
 
