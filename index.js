@@ -270,7 +270,14 @@ async function handlePullRequestEvent(payload) {
     lessons,
     octokit,
     repoFullName,
-    sha: pr.head.sha,
+    // Used only for the codebase-context lookup (fetching imported files'
+    // content via the GitHub API against `repoFullName`, which is always the
+    // base/upstream repo). pr.head.sha only exists in the base repo for
+    // same-repo branch PRs — for fork-originated PRs it's a commit in the
+    // contributor's fork, so fetching it against the upstream repo silently
+    // fails and codebase context degrades to empty. pr.base.sha always
+    // exists in the upstream repo regardless of PR origin.
+    sha: pr.base.sha,
   });
 
   logger.info({
