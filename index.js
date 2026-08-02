@@ -320,6 +320,7 @@ async function handlePullRequestEvent(payload) {
     lessons,
     octokit,
     repoFullName,
+    userId: repoConfig.userId,
     // Used only for the codebase-context lookup (fetching imported files'
     // content via the GitHub API against `repoFullName`, which is always the
     // base/upstream repo). pr.head.sha only exists in the base repo for

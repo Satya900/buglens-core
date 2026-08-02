@@ -95,6 +95,13 @@ async function evaluateFixture(fixture) {
     model,
     pr: fixture.pull_request,
     repoProfile,
+    // Always pass an explicit override (never leave it null) so this stays
+    // fully offline — null would make analyzePullRequest call the real
+    // getCodebaseContext, which touches Supabase/GitHub. Fixtures that want
+    // to test context-dependent scenarios set mock_codebase_context;
+    // everything else gets "" (no context), matching this harness's
+    // behavior before codebase context existed at all.
+    codebaseContextOverride: fixture.mock_codebase_context ?? "",
   });
 
   const actualFindings = analysis.findings.map((finding) => ({
