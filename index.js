@@ -15,11 +15,15 @@ import {
   isDeliveryAlreadyProcessed,
   getUserEmailPrefs,
   saveShadowReview,
+  tryAcquireIndexLock,
+  markIndexReady,
+  markIndexFailed,
 } from "./lib/supabase.js";
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
 import { readRepoBugLensConfig, mergeConfigs } from "./lib/config-reader.js";
 import { isExcludedFile } from "./lib/file-filters.js";
+import { buildFullRepoIndex } from "./lib/repo-index.js";
 import { sendReviewSummaryEmail } from "./lib/email.js";
 import { createModel } from "./lib/ai-provider.js";
 
@@ -49,6 +53,21 @@ async function getAuthenticatedClient(installationId) {
     installationId,
   });
   const { token } = await auth({ type: "installation" });
+  return new Octokit({ auth: token });
+}
+
+/**
+ * App-level (JWT) authenticated client — used only to resolve which
+ * installation owns a given repo when we don't already have a live webhook
+ * payload to pull installation.id from (the /internal/index-repo trigger
+ * on repo connect has no such payload).
+ */
+async function getAppLevelClient() {
+  const auth = createAppAuth({
+    appId: process.env.GITHUB_APP_ID,
+    privateKey: process.env.GITHUB_PRIVATE_KEY,
+  });
+  const { token } = await auth({ type: "app" });
   return new Octokit({ auth: token });
 }
 
@@ -108,6 +127,45 @@ async function handleInstallationEvent(payload) {
     });
     logger.info(`Registered installation for ${repo.full_name}`);
   }
+}
+
+/**
+ * Shared build->mark sequence for both the push-triggered and connect-
+ * triggered indexing paths. Caller must already hold the index lock
+ * (tryAcquireIndexLock) before calling this.
+ */
+async function runRepoIndex({ octokit, repoFullName, userId, sha }) {
+  try {
+    const result = await buildFullRepoIndex({ octokit, repoFullName, userId, sha });
+    await markIndexReady({ repoFullName, userId, sha, ...result });
+    logger.info({ msg: "Repo index ready", repo: repoFullName, sha, ...result });
+  } catch (err) {
+    await markIndexFailed({ repoFullName, userId, error: err.message });
+    logger.warn({ msg: "Repo index failed", repo: repoFullName, error: err.message });
+  }
+}
+
+/**
+ * Push-triggered reindexing. Default-branch pushes only — reindexing every
+ * branch of every open PR would multiply GitHub API cost for no benefit,
+ * since PR review itself always uses the live diff for changed files
+ * regardless of what's indexed.
+ */
+async function handlePushEvent(payload) {
+  if (payload.ref !== `refs/heads/${payload.repository.default_branch}`) return;
+  if (await isDeliveryAlreadyProcessed(payload.deliveryId)) return;
+
+  const repoFullName = payload.repository.full_name;
+  const [owner] = repoFullName.split("/");
+
+  const repoConfig = await getRepoReviewConfig({ repoFullName, githubOwner: owner });
+  if (!repoConfig || repoConfig.isActive === false) return;
+
+  const locked = await tryAcquireIndexLock({ repoFullName, userId: repoConfig.userId });
+  if (!locked) return; // already indexing — a later push re-triggers at its own sha
+
+  const octokit = await getAuthenticatedClient(payload.installation.id);
+  await runRepoIndex({ octokit, repoFullName, userId: repoConfig.userId, sha: payload.after });
 }
 
 /**
@@ -453,6 +511,19 @@ app.post("/webhook", webhookLimiter, verifySignature, async (req, res) => {
       return;
     }
 
+    if (event === "push") {
+      res.sendStatus(200);
+      setImmediate(async () => {
+        try {
+          await handlePushEvent(payload);
+        } catch (error) {
+          logger.error({ msg: "Async repo index crashed", error: error.message });
+          captureException(error, { deliveryId: payload.deliveryId });
+        }
+      });
+      return;
+    }
+
     return res.sendStatus(200);
   } catch (error) {
     logger.error({ msg: "Webhook handler crashed", error: error.message });
@@ -461,6 +532,61 @@ app.post("/webhook", webhookLimiter, verifySignature, async (req, res) => {
       return res.status(500).send("Internal Server Error");
     }
   }
+});
+
+// ── Internal: trigger an initial index when a repo is first connected ───────
+// Called by buglens-next right after a repo is registered, so new users get
+// context benefit from their very first PR instead of waiting for someone to
+// push to the default branch. Authenticated via the same shared WEBHOOK_SECRET
+// both apps already rely on — no live webhook payload exists for this
+// trigger, so the installation ID is resolved via the GitHub Apps (JWT) API
+// instead of pulled off a payload.
+function isValidInternalSecret(provided) {
+  if (!provided || !process.env.WEBHOOK_SECRET) return false;
+  const providedBuf = Buffer.from(provided, "utf8");
+  const expectedBuf = Buffer.from(process.env.WEBHOOK_SECRET, "utf8");
+  return providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf);
+}
+
+app.post("/internal/index-repo", async (req, res) => {
+  if (!isValidInternalSecret(req.headers["x-webhook-secret"])) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { repoFullName } = req.body ?? {};
+  if (!repoFullName) {
+    return res.status(400).json({ error: "repoFullName is required" });
+  }
+
+  res.sendStatus(202); // accepted — indexing runs async, this is best-effort
+
+  setImmediate(async () => {
+    try {
+      const [owner, repoName] = repoFullName.split("/");
+
+      const repoConfig = await getRepoReviewConfig({ repoFullName, githubOwner: owner });
+      if (!repoConfig || repoConfig.isActive === false) return;
+
+      const locked = await tryAcquireIndexLock({ repoFullName, userId: repoConfig.userId });
+      if (!locked) return;
+
+      const appClient = await getAppLevelClient();
+      const { data: installation } = await appClient.apps.getRepoInstallation({ owner, repo: repoName });
+      const octokit = await getAuthenticatedClient(installation.id);
+
+      const { data: repoData } = await octokit.repos.get({ owner, repo: repoName });
+      const { data: branch } = await octokit.repos.getBranch({
+        owner,
+        repo: repoName,
+        branch: repoData.default_branch,
+      });
+
+      await runRepoIndex({ octokit, repoFullName, userId: repoConfig.userId, sha: branch.commit.sha });
+    } catch (error) {
+      logger.error({ msg: "Initial repo index crashed", repo: repoFullName, error: error.message });
+      captureException(error, { repoFullName });
+    }
+  });
 });
 
 
