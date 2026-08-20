@@ -488,13 +488,23 @@ app.use(
   })
 );
 
-// Rate limit: max 30 webhook calls per minute per IP.
+// Rate limit by GitHub installation (or repo), not shared IP.
+// GitHub deliveries often share egress IPs; IP keys starve unrelated customers
+// and trust-proxy makes XFF spoofable on some hosts.
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 30,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: "Too many requests",
+  keyGenerator: (req) => {
+    const installationId = req.body?.installation?.id;
+    if (installationId) return `inst:${installationId}`;
+    const repo = req.body?.repository?.full_name;
+    if (repo) return `repo:${repo}`;
+    return `ip:${req.ip}`;
+  },
+  validate: { keyGeneratorIpFallback: false },
 });
 
 app.get("/health", (_req, res) => {
