@@ -183,11 +183,19 @@ async function dismissPreviousBugLensReviews(octokit, owner, repo, pullNumber) {
       per_page: 50,
     });
 
-    const bugLensReviews = reviews.filter(
-      (r) =>
-        (r.user?.type === "Bot" || r.user?.login?.toLowerCase().includes("buglens")) &&
-        (r.state === "CHANGES_REQUESTED" || r.state === "APPROVED" || r.state === "COMMENTED")
-    );
+    // Only dismiss our own app reviews. Matching any Bot would wipe Dependabot,
+    // CodeRabbit, Renovate, etc. on synchronize.
+    const bugLensReviews = reviews.filter((r) => {
+      const login = r.user?.login?.toLowerCase() || "";
+      const isBugLens =
+        login.includes("buglens") ||
+        login === process.env.GITHUB_APP_SLUG?.toLowerCase();
+      const dismissable =
+        r.state === "CHANGES_REQUESTED" ||
+        r.state === "APPROVED" ||
+        r.state === "COMMENTED";
+      return isBugLens && dismissable;
+    });
 
     for (const review of bugLensReviews) {
       try {
@@ -600,14 +608,20 @@ app.post("/internal/index-repo", async (req, res) => {
 
 // ── DEV-ONLY: AI model test endpoint ─────────────────────────────────────────
 // POST /dev/test-ai  — Body: { "model": "free"|"pro"|"qwen"|"gemma", "prompt": "..." }
-// Disabled automatically in production (NODE_ENV=production)
-if (process.env.NODE_ENV !== "production") {
+// Requires ENABLE_DEV_AI_TEST=1 AND x-webhook-secret matching WEBHOOK_SECRET.
+// NODE_ENV alone is not enough; a mis-set production env would otherwise expose
+// an unauthenticated LLM proxy.
+if (process.env.ENABLE_DEV_AI_TEST === "1" && process.env.NODE_ENV !== "production") {
   const OPENROUTER_TEST_MODELS = {
     gemma: "google/gemma-4-31b-it:free",
     qwen:  "qwen/qwen3-coder:free",
   };
 
   app.post("/dev/test-ai", async (req, res) => {
+    if (!isValidInternalSecret(req.headers["x-webhook-secret"])) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
     const { model: modelKey = "free", prompt } = req.body ?? {};
     if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
@@ -661,7 +675,7 @@ if (process.env.NODE_ENV !== "production") {
     }
   });
 
-  logger.info("DEV endpoint active: POST /dev/test-ai");
+  logger.info("DEV endpoint active: POST /dev/test-ai (secret required)");
 }
 
 const PORT = process.env.PORT || 3001;
