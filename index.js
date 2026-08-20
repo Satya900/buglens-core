@@ -18,6 +18,7 @@ import {
   tryAcquireIndexLock,
   markIndexReady,
   markIndexFailed,
+  tryClaimDelivery,
 } from "./lib/supabase.js";
 import { analyzePullRequest } from "./lib/review-engine.js";
 import { buildRepoProfile } from "./lib/repo-profile.js";
@@ -154,6 +155,7 @@ async function runRepoIndex({ octokit, repoFullName, userId, sha }) {
 async function handlePushEvent(payload) {
   if (payload.ref !== `refs/heads/${payload.repository.default_branch}`) return;
   if (await isDeliveryAlreadyProcessed(payload.deliveryId)) return;
+  if (!(await tryClaimDelivery(payload.deliveryId))) return;
 
   const repoFullName = payload.repository.full_name;
   const [owner] = repoFullName.split("/");
@@ -222,9 +224,14 @@ async function handlePullRequestEvent(payload) {
   const deliveryId = payload.deliveryId;
   const isReReview = action === "synchronize";
 
-  // Idempotency guard: skip if this exact GitHub delivery was already processed
+  // Idempotency: claim this delivery before any expensive work so GitHub
+  // retries that arrive while the first run is in flight are dropped.
   if (await isDeliveryAlreadyProcessed(deliveryId)) {
     logger.info(`Skipping duplicate delivery ${deliveryId} for ${repoFullName} #${pullNumber}`);
+    return;
+  }
+  if (!(await tryClaimDelivery(deliveryId))) {
+    logger.info(`Skipping already-claimed delivery ${deliveryId} for ${repoFullName} #${pullNumber}`);
     return;
   }
 
@@ -263,7 +270,7 @@ async function handlePullRequestEvent(payload) {
         owner,
         repo: repoName,
         issue_number: pullNumber,
-        body: `🛡️ **BugLens - Usage Limit Reached**\n\nYou have reached the limit for your current **${billing.tier}** plan. To continue receiving AI code reviews, please upgrade your subscription in the [BugLens Dashboard](https://buglens-next.vercel.app/billing).\n\n*Review scheduled for next month or upon upgrade.*`,
+        body: `🛡️ **BugLens - Usage Limit Reached**\n\nYou have reached the limit for your current **${billing.tier}** plan. To continue receiving AI code reviews, please upgrade your subscription in the [BugLens Dashboard](${(process.env.DASHBOARD_URL || "https://buglens.app").replace(/\/+$/, "")}/billing).\n\n*Review scheduled for next month or upon upgrade.*`,
       });
     }
     return;
@@ -274,7 +281,7 @@ async function handlePullRequestEvent(payload) {
   logger.info({ msg: "AI provider selected", tier: billing.tier, repo: repoFullName });
 
   // 2. Fetch Lessons (Point 3)
-  const lessons = await getLessonsLearned({ repoFullName });
+  const lessons = await getLessonsLearned({ repoFullName, userId: repoConfig.userId });
 
   let files = await fetchPullRequestFiles(octokit, owner, repoName, pullNumber);
   if (files.length === 0) return;

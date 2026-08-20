@@ -103,6 +103,13 @@ create table if not exists shadow_reviews (
   created_at timestamptz default now()
 );
 
+-- Early idempotency claim for GitHub webhook deliveries. Insert succeeds for
+-- the first worker; unique violation means a concurrent retry already owns it.
+create table if not exists webhook_deliveries (
+  delivery_id text primary key,
+  created_at timestamptz default now()
+);
+
 -- Persisted repo index: a structural (not embedding-based) import graph for
 -- each repo's default branch, refreshed on push (and on initial repo
 -- connect), used to give AI reviews real cross-file context instead of a
