@@ -86,7 +86,7 @@ See `.env.example` for all required variables and instructions.
 | Level | Min Confidence | Max Comments | REQUEST_CHANGES threshold |
 |-------|---------------|--------------|--------------------------|
 | relaxed | 66% | 20 | MEDIUM |
-| balanced | 70% | 15 | MEDIUM |
+| balanced | 60% | 15 | MEDIUM |
 | strict | 80% | 10 | LOW |
 
 Configure per-repo in the BugLens dashboard.
